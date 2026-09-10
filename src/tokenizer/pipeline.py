@@ -268,19 +268,69 @@ class TokenizerPipeline:
     def encode(
         self,
         token_df: cudf.DataFrame,
-        max_length: int = 4096,
+        max_length: Optional[int] = None,
         add_special: bool = True,
+        end_token: Optional[str] = "<eos>",
     ) -> np.ndarray:
         """Convert a token-string DataFrame to a padded int64 array.
 
-        Each row becomes: <bos> col1 col2 ... colN <eos> <pad> ...
-        Returns shape (n_rows, max_length).
+        Each row becomes: ``<bos> col1 col2 ... colN [end_token] <pad> ...``
+
+        Parameters
+        ----------
+        token_df : cudf.DataFrame
+            Output of transform() -- one column per token field, one row per
+            transaction.
+        max_length : int, optional
+            Width of the output array.  Defaults to exactly the number of
+            tokens a row needs, i.e. no padding.  Padding costs real compute
+            during embedding extraction (every pad position is still a
+            sequence position in the forward pass), so only widen this if a
+            downstream consumer needs a fixed width.
+        add_special : bool
+            Prepend <bos> (and append *end_token*, if set).
+        end_token : str or None
+            Terminator appended after the field tokens.  Must be one of the
+            pipeline's special tokens, or None.
+
+            "<eos>" reproduces the original behaviour.  Prefer None (row ends
+            on the last field token) or "<sep>" (row ends on a transaction
+            boundary): during pretraining <eos> only ever appears at the very
+            end of a ~4096-token corpus line, so its hidden state encodes
+            "end of a long history".  Pooling on <eos> after a 12-token
+            single transaction queries the model at a position it never saw
+            in training.  The last field token and <sep>, by contrast, occur
+            at every transaction boundary in every corpus line.
+
+        Returns
+        -------
+        np.ndarray of shape (n_rows, max_length), dtype int64.
         """
         vocab = self._vocab
         pad_id = self.special_token_ids["<pad>"]
         bos_id = self.special_token_ids["<bos>"]
-        eos_id = self.special_token_ids["<eos>"]
         unk_id = self.special_token_ids["<unk>"]
+
+        if end_token is not None and end_token not in self.special_token_ids:
+            raise ValueError(
+                f"end_token {end_token!r} is not a special token; expected "
+                f"one of {sorted(self.special_token_ids)} or None"
+            )
+
+        n_prefix = 1 if add_special else 0
+        n_suffix = 1 if (add_special and end_token is not None) else 0
+        required = n_prefix + len(token_df.columns) + n_suffix
+
+        if max_length is None:
+            max_length = required
+        elif max_length < required:
+            # Silently truncating a fixed-width record drops whole fields and
+            # shifts the last-token pooling position, so refuse instead.
+            raise ValueError(
+                f"max_length={max_length} is too small for "
+                f"{len(token_df.columns)} fields + {n_prefix + n_suffix} "
+                f"special tokens (need >= {required})"
+            )
 
         n = len(token_df)
         padded = np.full((n, max_length), pad_id, dtype=np.int64)
@@ -291,15 +341,13 @@ class TokenizerPipeline:
             col_offset = 1
 
         for col_name in token_df.columns:
-            if col_offset >= max_length:
-                break
             host_col = token_df[col_name].to_pandas()
             ids = host_col.map(vocab).fillna(unk_id).astype(np.int64).values
             padded[:, col_offset] = ids
             col_offset += 1
 
-        if add_special and col_offset < max_length:
-            padded[:, col_offset] = eos_id
+        if n_suffix:
+            padded[:, col_offset] = self.special_token_ids[end_token]
 
         return padded
 
